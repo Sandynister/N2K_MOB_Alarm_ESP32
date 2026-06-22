@@ -32,11 +32,13 @@
 
 // to be printed out to USB-serial
 const char Description[] = "MOB-Alarm Button. Comes without any warranty or reliability. Only for test purposes!";
-
+// Vor dem Aufruf von SendN2kMOBAlarm() hinzufügen:
+const char* mobText = "MOB ALARM";  // oder dein gewünschter Text
 
 #define ALARM_BUTTON    13          // GPIO pin to be connected to GND when the alarm button is pressed
-#define MYMMSI          123456789   // set your MMSI in here
+#define MYMMSI          211311370   // set your MMSI in here
 #define ACTIVATION_TIME  5          // seconds the button has to be pressed to activate the alarm
+#define AIS_MOB_MMSI    972311370   // 972 + last 7 digits of MYMMSI (123456789 → 2345678 → 972234567... adjust to your MMSI)
 
 int NodeAddress;            // To store last Node Address
 Preferences preferences;    // Nonvolatile storage on ESP32 - To store LastDeviceAddress
@@ -65,7 +67,7 @@ PGN127233 PGNOut;
 
 // Set the information for other devices on the bus which messages we support
 const unsigned long  ReceiveMessages[] PROGMEM = { 129029L, 129026L, 0};  // get navigational data
-const unsigned long TransmitMessages[] PROGMEM = {127233L, 0};            // send man over board alarm
+const unsigned long TransmitMessages[] PROGMEM = {127233L, 129038L, 129802L, 0};           // send man over board alarm
 
 // forward declarations
 void          SayHello(void);           
@@ -75,8 +77,9 @@ void          MyParsePGN129029(const tN2kMsg);
 void          MyParsePGN129026(const tN2kMsg);
 void          MyHandleNMEA2000Msg(const tN2kMsg &);
 void          DispMessage();
-
-
+void          handleSerialInput();
+void          HandleNMEA2000Msg(const tN2kMsg &N2kMsg);
+void          SendRaymarineMOB(bool); 
 
 //*****************************************************************************
 void setup()
@@ -90,6 +93,7 @@ void setup()
   // Init USB serial port
   Serial.begin(115200);
   delay(400);
+
 
   SayHello();  // print some useful information to USB-serial
 
@@ -137,6 +141,7 @@ void setup()
   NMEA2000.Open();
   
   pinMode(ALARM_BUTTON, INPUT_PULLUP);  
+  NMEA2000.SetMsgHandler(HandleNMEA2000Msg);
 }
 
 
@@ -162,7 +167,8 @@ void loop()
   // Dummy to empty input buffer to avoid board to stuck with e.g. NMEA Reader
   if ( Serial.available() ) 
   {
-    Serial.read();
+    handleSerialInput();
+    //Serial.read();
   }
 }
 
@@ -235,9 +241,48 @@ void SendN2kMOBAlarm(void)
                           PGNOut.MOBEmitterBatteryStatus);
                                           
     NMEA2000.SendMsg(N2kMsg);
-    delay(1000);
 
-    Serial.println("MOB-Alarm sent!");
+  Serial.println("  -> PGN 127233 sent");
+ 
+  // --- PGN 129038: AIS Class A Position Report ---
+  // Library signature:
+  //   SetN2kAISClassAPosition(N2kMsg, MessageID, Repeat, UserID,
+  //     Latitude, Longitude, Accuracy, RAIM, Seconds,
+  //     COG, SOG, AISTransceiverInformation, Heading, ROT, NavStatus)
+  // NavStatus N2kaisns_AIS_SART_is_active (=14) is what triggers MOB on Raymarine Axiom
+  SetN2kAISClassAPosition(N2kMsg,
+                          1,                              // MessageID: AIS message type 1
+                          N2kaisr_First,                  // Repeat: not repeated
+                          AIS_MOB_MMSI,                   // UserID: 972311370
+                          PGNOut.LatitudeOfMob,
+                          PGNOut.LongitudeOfMob,
+                          true,                           // Accuracy: high
+                          false,                          // RAIM: not active
+                          60,                             // Seconds: 60 = not available
+                          PGNOut.COG,
+                          PGNOut.SOG,
+                          N2kaischannel_A_VDL_reception,  // AISTransceiverInformation
+                          N2kDoubleNA,                    // Heading: not available
+                          N2kDoubleNA,                    // ROT: not available
+                          N2kaisns_AIS_SART);   // NavStatus 14 = MOB/SART active
+  NMEA2000.SendMsg(N2kMsg);
+  Serial.println("  -> PGN 129038 (AIS NavStatus=14) sent");
+ 
+  // --- PGN 129802: AIS Safety Related Broadcast Message ---
+  // Library signature:
+  //   SetN2kAISSafetyRelatedBroadcastMsg(N2kMsg, MessageID, Repeat,
+  //     SourceID, AISTransceiverInformation, SafetyRelatedText)
+  SetN2kAISSafetyRelatedBroadcastMsg(N2kMsg,
+                                     14,                             // MessageID: AIS msg type 14
+                                     N2kaisr_First,                  // Repeat: not repeated
+                                     AIS_MOB_MMSI,                   // SourceID
+                                     N2kaischannel_A_VDL_reception,  // AISTransceiverInformation
+                                     mobText);                       // SafetyRelatedText
+  NMEA2000.SendMsg(N2kMsg);
+  Serial.println("  -> PGN 129802 (AIS Safety 'MOB ALARM') sent");
+ 
+  delay(1000);
+  Serial.println("MOB-Alarm sent!");
     
 }
 
@@ -279,6 +324,46 @@ void SayHello()
   sprintf(buf, "\nSketch: \"%s\", compiled %s, %s\n", Sketch, __DATE__, __TIME__);
   Serial.println(buf);
   Serial.println(Description);
+
+  Serial.println("SGS MOB System bereit.");
+  Serial.println("Befehle: -h (Hilfe), -a (MOB Alarm ausloesen)");
+}
+
+String serialBuffer = "";
+
+// Neue Funktion für Serial-CLI:
+void handleSerialInput() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    
+    if (c == '\n' || c == '\r') {
+      serialBuffer.trim();
+      
+      if (serialBuffer == "-h") {
+        Serial.println("=== SGS MOB CLI ===");
+        Serial.println("-h   Hilfe anzeigen");
+        Serial.println("-a   MOB Alarm ausloesen");
+      } 
+      else if (serialBuffer == "-a") {
+        Serial.println(">>> MOB ALARM wird ausgeloest!");
+        SendN2kMOBAlarm();  // deine bestehende Funktion
+      }
+      else if (serialBuffer == "-r") {
+        SendRaymarineMOB(true);
+      }
+      else if (serialBuffer == "-d") {
+        SendRaymarineMOB(false);
+        Serial.println("Befehle: -h (Hilfe), -a (MOB SART an), -r (MOB Ray an) -d (MOB aus)");
+      }
+      else if (serialBuffer.length() > 0) {
+        Serial.println("Unbekannter Befehl. '-h' fuer Hilfe.");
+      }
+      
+      serialBuffer = "";
+    } else {
+      serialBuffer += c;
+    }
+  }
 }
 
 
@@ -301,6 +386,83 @@ void DispMessage()
                             PGNOut.MOBEmitterBatteryStatus);
 }
 
+void HandleNMEA2000Msg(const tN2kMsg &N2kMsg) {
+  
+  return; 
+const unsigned long ignoredPGNs[] = {
+    // Bereits gefiltert
+    129025,  127250,  127251,  127257,  127245,
+    130306,  126208,  126720,  65359,   128259,
+    130311,  128267,  128275,  127258,  65379,
+    65384,   129026,  127237,  129038,  129039,
+    129033,  129029,  129540,  129542,  126992,
+    129284,  129285,  129283,  130577,  130848,
+    130918,  130916,  65520,   129291,  61184,
+    65396,
+
+    // NEU hinzufügen
+    129794,  // AIS Class A Static & Voyage (Dauerstrom)
+    129809,  // AIS Class B CS Static Data Part A
+    129810,  // AIS Class B CS Static Data Part B
+    129793,  // AIS UTC/Date Report
+    130934,  // Proprietär AIS
+    130935,  // Proprietär AIS
+    129044,  // Datum
+    65311,   // Proprietär
+    65535,   // Proprietär
+
+    0        // Ende der Liste - IMMER als letztes lassen!
+};
+  // Prüfen ob PGN gefiltert werden soll
+  for (int i = 0; ignoredPGNs[i] != 0; i++) {
+    if (N2kMsg.PGN == ignoredPGNs[i]) return;
+  }
+
+  // Ausgabe nur für nicht gefilterte PGNs
+  Serial.print("PGN: ");
+  Serial.print(N2kMsg.PGN);
+  Serial.print("  Src: ");
+  Serial.print(N2kMsg.Source);
+  Serial.print("  Len: ");
+  Serial.print(N2kMsg.DataLen);
+  Serial.print("  Data: ");
+  for (int i = 0; i < N2kMsg.DataLen; i++) {
+    if (N2kMsg.Data[i] < 0x10) Serial.print("0");
+    Serial.print(N2kMsg.Data[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
 
 
+void SendRaymarineMOB(bool activate) {
+  tN2kMsg N2kMsg;
 
+  // Nachricht 1
+  N2kMsg.Init(6, 65288, 36, 255);
+  N2kMsg.AddByte(0x3B); N2kMsg.AddByte(0x9F);
+  N2kMsg.AddByte(0xFF); N2kMsg.AddByte(activate ? 0x01 : 0x00);
+  N2kMsg.AddByte(0x26); N2kMsg.AddByte(0x03);
+  N2kMsg.AddByte(0x00); N2kMsg.AddByte(0xC0);
+  NMEA2000.SendMsg(N2kMsg);
+
+  // Nachricht 2
+  N2kMsg.Init(6, 65288, 36, 255);
+  N2kMsg.AddByte(0x3B); N2kMsg.AddByte(0x9F);
+  N2kMsg.AddByte(0xFF); N2kMsg.AddByte(activate ? 0x01 : 0x00);
+  N2kMsg.AddByte(0x72); N2kMsg.AddByte(0x03);
+  N2kMsg.AddByte(0x00); N2kMsg.AddByte(0xC0);
+  NMEA2000.SendMsg(N2kMsg);
+
+  // Nachricht 3 - nur beim Aktivieren
+  if (activate) {  
+    N2kMsg.Init(6, 65361, 36, 255);
+    N2kMsg.AddByte(0x3B); N2kMsg.AddByte(0x9F);
+    N2kMsg.AddByte(0x26); N2kMsg.AddByte(0x03);
+    N2kMsg.AddByte(0xFF); N2kMsg.AddByte(0xFF);
+    N2kMsg.AddByte(0xFF); N2kMsg.AddByte(0xFF);
+    NMEA2000.SendMsg(N2kMsg);
+  }
+
+  Serial.println(activate ? ">>> MOB ALARM AKTIVIERT!" : ">>> MOB ALARM DEAKTIVIERT!");
+}
